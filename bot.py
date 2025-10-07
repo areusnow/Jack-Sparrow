@@ -6,7 +6,7 @@ import asyncio
 import time
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError
 from flask import Flask
 from threading import Thread
 from waitress import serve
@@ -85,11 +85,12 @@ app = Flask(__name__)
 def home():
     status = "Indexing..." if indexing_in_progress else "Ready"
     return f'''
-    <h1>🎬 Movie Bot v4.2 (Fixed)</h1>
+    <h1>🎬 Movie Bot v5.0 (Bot-Compatible)</h1>
     <p>Status: {status}</p>
     <p>Total Movies: {len(movies_db)}</p>
     <p>Last Indexed: {last_indexed or "Never"}</p>
     <p>Channel: {CHANNEL_USERNAME}</p>
+    <p><small>Real-time indexing + Message ID scanning</small></p>
     ''', 200
 
 @app.route('/health')
@@ -175,65 +176,110 @@ def calculate_match_score(query, movie_data):
         score += 50
     return score
 
+def index_message(message):
+    """Index a single message"""
+    try:
+        text = message.text or message.caption or ""
+        if not text and not (message.video or message.document):
+            return False
+
+        title = extract_movie_title(message.text, message.caption)
+        keywords = extract_keywords(text)
+        media_type = None
+        if message.video:
+            media_type = 'video'
+        elif message.document:
+            media_type = 'document'
+        elif message.photo:
+            media_type = 'photo'
+
+        movies_db[message.id] = {
+            'id': message.id,
+            'title': title,
+            'text': text[:500],
+            'keywords': keywords,
+            'media_type': media_type,
+            'date': message.date.strftime('%Y-%m-%d') if message.date else None
+        }
+        return True
+    except Exception as e:
+        logger.debug(f"Error indexing message {message.id}: {e}")
+        return False
+
 # ==============================
-# ⚙️ INDEXING
+# ⚙️ AUTO-INDEXING NEW POSTS
 # ==============================
 
-async def index_channel():
+@bot.on_message(filters.channel)
+async def auto_index_channel_post(client, message: Message):
+    """Automatically index new channel posts"""
+    try:
+        # Check if it's from our target channel
+        if message.chat.username != CHANNEL_USERNAME.lstrip('@'):
+            return
+        
+        if index_message(message):
+            logger.info(f"✅ Auto-indexed: {message.id} - {movies_db[message.id]['title']}")
+            # Auto-save every 10 new posts
+            if len(movies_db) % 10 == 0:
+                save_db()
+    except Exception as e:
+        logger.error(f"Auto-index error: {e}")
+
+# ==============================
+# ⚙️ MESSAGE ID SCANNING
+# ==============================
+
+async def scan_by_message_ids(start_id=1, end_id=1000, batch_size=50):
+    """
+    Scan messages by trying sequential message IDs
+    This works because bots CAN forward messages if they know the ID
+    """
     global indexing_in_progress, last_indexed
     indexing_in_progress = True
-    logger.info("🔄 Starting channel indexing...")
+    logger.info(f"🔄 Scanning message IDs {start_id} to {end_id}...")
 
     try:
+        chat = await bot.get_chat(CHANNEL_USERNAME)
         indexed = 0
         start_time = time.time()
-
-        # FIXED: Use iter_chat_history instead of get_chat_history
-        async for message in bot.iter_chat_history(CHANNEL_USERNAME, limit=5000):
+        
+        for msg_id in range(start_id, end_id + 1):
             try:
-                text = message.text or message.caption or ""
-                if not text and not (message.video or message.document):
-                    continue
-
-                title = extract_movie_title(message.text, message.caption)
-                keywords = extract_keywords(text)
-                media_type = None
-                if message.video:
-                    media_type = 'video'
-                elif message.document:
-                    media_type = 'document'
-                elif message.photo:
-                    media_type = 'photo'
-
-                movies_db[message.id] = {
-                    'id': message.id,
-                    'title': title,
-                    'text': text[:500],
-                    'keywords': keywords,
-                    'media_type': media_type,
-                    'date': message.date.strftime('%Y-%m-%d') if message.date else None
-                }
-
-                indexed += 1
-                if indexed % 200 == 0:
-                    logger.info(f"Indexed {indexed} messages... autosaving")
-                    save_db()
-                    await asyncio.sleep(1)
-
+                # Try to get the message by ID
+                message = await bot.get_messages(chat.id, msg_id)
+                
+                if message and not message.empty:
+                    if index_message(message):
+                        indexed += 1
+                        
+                        if indexed % 50 == 0:
+                            logger.info(f"✅ Scanned: {indexed} messages (currently at ID {msg_id})")
+                            save_db()
+                
+                # Rate limiting
+                if msg_id % batch_size == 0:
+                    await asyncio.sleep(2)
+                    
             except FloodWait as e:
                 logger.warning(f"FloodWait: sleeping {e.value}s")
                 await asyncio.sleep(e.value)
+            except RPCError as e:
+                # Message not found or deleted - skip silently
+                pass
             except Exception as e:
-                logger.debug(f"Error indexing message: {e}")
+                logger.debug(f"Error at ID {msg_id}: {e}")
                 continue
 
         elapsed = time.time() - start_time
         last_indexed = time.strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"✅ Indexing complete: {indexed} movies in {elapsed:.2f}s")
+        logger.info(f"✅ Scan complete: {indexed} movies in {elapsed:.2f}s")
         save_db()
+        return indexed
 
     except Exception as e:
-        logger.error(f"Indexing error: {e}")
+        logger.error(f"Scanning error: {e}")
+        return 0
     finally:
         indexing_in_progress = False
 
@@ -244,18 +290,19 @@ async def index_channel():
 @bot.on_message(filters.command("start") & filters.private)
 async def start_command(client, message: Message):
     welcome = (
-        "🎬 **Movie Bot v4.2 - Fixed!**\n\n"
+        "🎬 **Movie Bot v5.0 - Bot-Compatible!**\n\n"
         "Just type a movie name to search!\n\n"
         "**Commands:**\n"
         "• /search <name> - Search movies\n"
-        "• /latest - Latest 10 movies\n"
         "• /stats - Statistics\n"
-        "• /index - Rebuild index\n"
+        "• /index - Scan old messages (by ID)\n"
         "• /help - This message\n\n"
         "**Examples:**\n"
         "`Avengers`\n"
         "`Kantara`\n"
-        "`Iron Man`"
+        "`Iron Man`\n\n"
+        "**Note:** New posts are indexed automatically!\n"
+        "Use /index to scan old messages (1-5000)."
     )
     await message.reply_text(welcome)
 
@@ -271,7 +318,11 @@ async def stats_command(client, message: Message):
         f"Status: {status}\n"
         f"Indexed Movies: **{len(movies_db)}**\n"
         f"Last Indexed: {last_indexed or 'Never'}\n"
-        f"Channel: `{CHANNEL_USERNAME}`"
+        f"Channel: `{CHANNEL_USERNAME}`\n\n"
+        f"💡 **How it works:**\n"
+        f"• New posts → Auto-indexed ✅\n"
+        f"• Old posts → Use /index to scan\n"
+        f"• No admin needed! 🎉"
     )
     await message.reply_text(stats)
 
@@ -280,30 +331,23 @@ async def index_command(client, message: Message):
     if indexing_in_progress:
         await message.reply_text("⏳ Indexing already in progress...")
         return
-    status_msg = await message.reply_text("🔄 Starting indexing...")
-    await index_channel()
-    await status_msg.edit_text(f"✅ Indexed {len(movies_db)} movies!")
-
-@bot.on_message(filters.command("latest") & filters.private)
-async def latest_command(client, message: Message):
-    status_msg = await message.reply_text("📥 Fetching latest movies...")
-    count = 0
-    try:
-        # FIXED: Use iter_chat_history
-        async for msg in bot.iter_chat_history(CHANNEL_USERNAME, limit=10):
-            try:
-                await msg.forward(message.chat.id)
-                count += 1
-                await asyncio.sleep(0.5)
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-            except Exception as e:
-                logger.debug(f"Could not forward: {e}")
-        await status_msg.delete()
-        await message.reply_text(f"✅ Sent {count} latest movies")
-    except Exception as e:
-        logger.error(f"Latest error: {e}")
-        await message.reply_text("❌ Error fetching movies")
+    
+    # Parse custom range if provided
+    parts = message.text.split()
+    if len(parts) >= 3:
+        try:
+            start = int(parts[1])
+            end = int(parts[2])
+            status_msg = await message.reply_text(f"🔄 Scanning message IDs {start} to {end}...")
+            count = await scan_by_message_ids(start, end)
+            await status_msg.edit_text(f"✅ Scan complete! Found {count} movies.\nTotal in DB: {len(movies_db)}")
+        except ValueError:
+            await message.reply_text("❌ Invalid format! Use: `/index 1 1000`")
+    else:
+        # Default scan range
+        status_msg = await message.reply_text("🔄 Scanning message IDs 1-5000...\n⏱️ This may take 3-5 minutes...")
+        count = await scan_by_message_ids(1, 5000)
+        await status_msg.edit_text(f"✅ Scan complete! Found {count} movies.\nTotal in DB: {len(movies_db)}")
 
 @bot.on_message(filters.command("search") & filters.private)
 async def search_command(client, message: Message):
@@ -323,11 +367,15 @@ async def handle_text(client, message: Message):
 
 async def perform_search(client, message: Message, query: str):
     if not movies_db:
-        await message.reply_text("⏳ Database is empty. Running /index first...")
-        await index_channel()
-        if not movies_db:
-            await message.reply_text("❌ No movies found in channel")
-            return
+        await message.reply_text(
+            "⏳ **Database is empty!**\n\n"
+            "**Options:**\n"
+            "1. Use `/index` to scan old messages (IDs 1-5000)\n"
+            "2. Wait for new posts (they auto-index)\n"
+            "3. Use `/index 1 1000` for smaller range\n\n"
+            "**No admin needed!** ✅"
+        )
+        return
 
     search_msg = await message.reply_text(f"🔍 Searching for '**{query}**'...")
 
@@ -343,22 +391,23 @@ async def perform_search(client, message: Message, query: str):
     await search_msg.delete()
 
     if not results:
-        await message.reply_text(f"❌ No results for '**{query}**'")
+        await message.reply_text(f"❌ No results for '**{query}**'\n\nTry running `/index` to scan more messages!")
         return
 
-    summary = f"✅ **Found {len(results[:5])} result(s):**\n\n"
+    summary = f"✅ **Found {min(len(results), 5)} result(s):**\n\n"
     for i, r in enumerate(results[:5], 1):
         summary += f"{i}. {r['title']}\n"
     await message.reply_text(summary)
 
+    chat = await bot.get_chat(CHANNEL_USERNAME)
     for result in results[:5]:
         try:
-            await bot.forward_messages(message.chat.id, CHANNEL_USERNAME, result['msg_id'])
+            await bot.copy_message(message.chat.id, chat.id, result['msg_id'])
             await asyncio.sleep(0.5)
         except FloodWait as e:
             await asyncio.sleep(e.value)
         except Exception as e:
-            logger.error(f"Error forwarding {result['msg_id']}: {e}")
+            logger.error(f"Error copying {result['msg_id']}: {e}")
 
 # ==============================
 # 🚀 STARTUP
@@ -367,10 +416,16 @@ async def perform_search(client, message: Message, query: str):
 async def startup():
     logger.info("🤖 Bot started successfully!")
     load_db()
+    
     if not movies_db:
-        logger.info("🔄 Running initial indexing...")
-        await index_channel()
-    logger.info("✅ Bot ready to serve!")
+        logger.info("📭 Database empty. Options:")
+        logger.info("   1. Wait for new posts (auto-indexed)")
+        logger.info("   2. Run /index to scan message IDs 1-5000")
+        logger.info("   3. Database will build over time!")
+    else:
+        logger.info(f"✅ Loaded {len(movies_db)} movies from disk")
+    
+    logger.info("✅ Bot ready! Real-time indexing active.")
 
 async def main():
     flask_thread = Thread(target=run_flask, daemon=True)
@@ -380,5 +435,5 @@ async def main():
         await idle()
 
 if __name__ == '__main__':
-    logger.info("🎬 Starting Movie Bot v4.2 (Fixed)...")
+    logger.info("🎬 Starting Movie Bot v5.0 (Bot-Compatible)...")
     asyncio.run(main())

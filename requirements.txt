@@ -1,5 +1,7 @@
-setuptools
-wheel
-aiogram==3.4.1
-python-dotenv==1.0.1
-rapidfuzz==3.10.0
+pyrogram
+tgcrypto
+python-dotenv
+fuzzywuzzy
+python-Levenshtein
+flask
+sqlite3-bro

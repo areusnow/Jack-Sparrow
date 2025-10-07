@@ -1,11 +1,13 @@
 import os
 import logging
 import re
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import FloodWait
 from flask import Flask
 from threading import Thread
-import json
+import asyncio
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -15,413 +17,379 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Environment variables
+API_ID = os.environ.get('API_ID')  # Get from my.telegram.org
+API_HASH = os.environ.get('API_HASH')  # Get from my.telegram.org
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-CHANNEL_ID = os.environ.get('CHANNEL_ID')
+CHANNEL_USERNAME = os.environ.get('CHANNEL_USERNAME')  # @channelname or channel ID
 PORT = int(os.environ.get('PORT', 8080))
 
-# Validate environment variables
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN is not set!")
-    exit(1)
-if not CHANNEL_ID:
-    logger.error("CHANNEL_ID is not set!")
+# Validate
+if not all([API_ID, API_HASH, BOT_TOKEN, CHANNEL_USERNAME]):
+    logger.error("Missing environment variables!")
+    logger.error("Required: API_ID, API_HASH, BOT_TOKEN, CHANNEL_USERNAME")
     exit(1)
 
 logger.info("="*50)
+logger.info(f"API ID: {API_ID}")
 logger.info(f"Bot Token: {BOT_TOKEN[:20]}...")
-logger.info(f"Channel ID: {CHANNEL_ID}")
-logger.info(f"Port: {PORT}")
+logger.info(f"Channel: {CHANNEL_USERNAME}")
 logger.info("="*50)
 
-# In-memory movie database
-movies_db = {}  # {msg_id: {"title": "", "text": "", "keywords": []}}
+# Movie database - stores indexed movies
+movies_db = {}  # {msg_id: {title, text, keywords, date, media_type}}
+indexing_in_progress = False
+last_indexed = None
 
-# Flask app
+# Flask for health checks
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f'Movie Bot v2.0 is running! 🎬<br>Indexed movies: {len(movies_db)}', 200
+    status = "Indexing..." if indexing_in_progress else "Ready"
+    return f'''
+    <h1>🎬 Movie Bot v4.0 (Pyrogram)</h1>
+    <p>Status: {status}</p>
+    <p>Total Movies: {len(movies_db)}</p>
+    <p>Last Indexed: {last_indexed or "Never"}</p>
+    <p>Channel: {CHANNEL_USERNAME}</p>
+    ''', 200
 
 @app.route('/health')
 def health():
     return 'OK', 200
 
-@app.route('/stats')
-def stats():
-    return {
-        'total_movies': len(movies_db),
-        'status': 'running'
-    }, 200
+# Initialize Pyrogram client
+bot = Client(
+    "movie_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
 # Helper functions
-def extract_movie_title(text):
-    """Extract movie title from text"""
+def clean_text(text):
+    """Clean text for processing"""
     if not text:
-        return "Unknown"
+        return ""
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def extract_movie_title(text, caption=None):
+    """Extract movie title intelligently"""
+    content = text or caption or ""
+    if not content:
+        return "Unknown Movie"
     
-    # Common patterns for movie titles
-    patterns = [
-        r'^([^\n\r]+?)(?:\(|\.|\||#)',  # Title before (, ., |, #
-        r'(?:Movie|Film)[\s:]+([^\n\r]+)',  # After "Movie:" or "Film:"
-        r'^([A-Z][^\n\r]{2,50})',  # Capitalized first line
-    ]
+    lines = content.split('\n')
     
-    for pattern in patterns:
-        match = re.search(pattern, text.strip(), re.IGNORECASE)
-        if match:
-            title = match.group(1).strip()
-            if len(title) > 3:
-                return title
+    # Try first non-empty line
+    for line in lines[:3]:  # Check first 3 lines
+        line = clean_text(line)
+        # Remove emojis and special chars
+        line = re.sub(r'[^\w\s\-:().]', '', line)
+        if len(line) > 3 and not line.lower().startswith(('http', 'www', 'join', 'channel')):
+            return line[:80]  # Max 80 chars
     
-    # Fallback: first line or first 50 chars
-    first_line = text.split('\n')[0].strip()
-    return first_line[:50] if first_line else "Unknown"
+    return clean_text(content[:80])
 
 def extract_keywords(text):
-    """Extract searchable keywords from text"""
+    """Extract searchable keywords"""
     if not text:
-        return []
+        return set()
     
-    # Convert to lowercase
     text = text.lower()
-    
-    # Remove special characters but keep spaces and alphanumeric
+    # Remove URLs
+    text = re.sub(r'http\S+', '', text)
+    # Keep only alphanumeric
     text = re.sub(r'[^\w\s]', ' ', text)
     
-    # Split into words
     words = text.split()
     
-    # Remove common words and short words
-    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
-                  'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
-                  'movie', 'film', 'watch', 'download', 'link', 'join', 'channel'}
+    # Stop words
+    stop_words = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of',
+        'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be', 'have',
+        'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may',
+        'might', 'must', 'can', 'movie', 'film', 'watch', 'download', 'free', 'full',
+        'hd', 'quality', 'link', 'join', 'channel', 'telegram', 'group', 'size', 'mb', 'gb'
+    }
     
-    keywords = [w for w in words if len(w) > 2 and w not in stop_words]
-    
-    return list(set(keywords))  # Remove duplicates
+    keywords = {w for w in words if len(w) > 2 and w not in stop_words}
+    return keywords
 
-def calculate_relevance(query, movie_data):
-    """Calculate relevance score for a movie"""
+def calculate_match_score(query, movie_data):
+    """Calculate relevance score"""
     score = 0
-    query_lower = query.lower()
-    query_words = query_lower.split()
+    query = query.lower().strip()
+    query_words = set(query.split())
     
     title = movie_data.get('title', '').lower()
+    keywords = movie_data.get('keywords', set())
     text = movie_data.get('text', '').lower()
-    keywords = movie_data.get('keywords', [])
     
-    # Exact title match = highest score
-    if query_lower == title:
-        score += 100
+    # Exact title match
+    if query == title:
+        return 10000
     
-    # Title contains query
-    if query_lower in title:
-        score += 50
+    # Query in title
+    if query in title:
+        score += 5000
     
     # Title starts with query
-    if title.startswith(query_lower):
-        score += 30
+    if title.startswith(query):
+        score += 3000
     
-    # Each query word in title
-    for word in query_words:
-        if word in title:
-            score += 20
+    # Word matches in title
+    title_words = set(title.split())
+    title_matches = len(query_words & title_words)
+    score += title_matches * 1000
     
-    # Each query word in keywords
-    for word in query_words:
-        if word in keywords:
-            score += 10
+    # Keyword matches
+    keyword_matches = len(query_words & keywords)
+    score += keyword_matches * 500
     
-    # Query in text
-    if query_lower in text:
-        score += 5
+    # Query in full text
+    if query in text:
+        score += 100
+    
+    # Bonus for video/document
+    if movie_data.get('media_type') in ['video', 'document']:
+        score += 50
     
     return score
 
-async def index_channel_messages(context, max_messages=500):
-    """Index all messages from channel for faster searching"""
+async def index_channel():
+    """Index all messages from channel - FAST with Pyrogram"""
+    global movies_db, indexing_in_progress, last_indexed
+    
+    indexing_in_progress = True
     logger.info("🔄 Starting channel indexing...")
-    indexed = 0
     
     try:
-        # Try to get messages from the channel
-        for msg_id in range(1, max_messages + 1):
+        indexed = 0
+        start_time = time.time()
+        
+        # Pyrogram allows us to iterate through messages directly!
+        async for message in bot.get_chat_history(CHANNEL_USERNAME, limit=1000):
             try:
-                # Try to get the message info without forwarding
-                # We'll just store basic info for now
-                # In a real scenario, you'd fetch actual message details
-                movies_db[msg_id] = {
-                    'id': msg_id,
-                    'title': f'Movie_{msg_id}',
-                    'text': '',
-                    'keywords': []
+                # Get message content
+                text = message.text or message.caption or ""
+                
+                if not text and not (message.video or message.document):
+                    continue  # Skip empty messages without media
+                
+                # Extract info
+                title = extract_movie_title(message.text, message.caption)
+                keywords = extract_keywords(text)
+                
+                # Determine media type
+                media_type = None
+                if message.video:
+                    media_type = 'video'
+                elif message.document:
+                    media_type = 'document'
+                elif message.photo:
+                    media_type = 'photo'
+                
+                # Store in database
+                movies_db[message.id] = {
+                    'id': message.id,
+                    'title': title,
+                    'text': text[:500],  # Store first 500 chars
+                    'keywords': keywords,
+                    'media_type': media_type,
+                    'date': message.date.strftime('%Y-%m-%d') if message.date else None
                 }
+                
                 indexed += 1
                 
-                if indexed % 50 == 0:
+                if indexed % 100 == 0:
                     logger.info(f"Indexed {indexed} messages...")
-                    
+                
             except Exception as e:
+                logger.debug(f"Error indexing message: {e}")
                 continue
         
-        logger.info(f"✅ Indexing complete: {indexed} messages indexed")
-        return indexed
+        elapsed = time.time() - start_time
+        logger.info(f"✅ Indexing complete: {indexed} movies in {elapsed:.2f}s")
+        last_indexed = time.strftime('%Y-%m-%d %H:%M:%S')
+        
+    except FloodWait as e:
+        logger.warning(f"FloodWait: sleeping for {e.value}s")
+        await asyncio.sleep(e.value)
     except Exception as e:
         logger.error(f"Indexing error: {e}")
-        return 0
+    finally:
+        indexing_in_progress = False
 
-# Telegram bot handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message"""
-    logger.info(f"START command from user {update.effective_user.id}")
-    welcome_text = (
-        "🎬 *Welcome to Movie Bot v2.0!*\n\n"
-        "*Commands:*\n"
-        "• /search <movie> - Smart search\n"
-        "• /latest - Latest movies\n"
-        "• /index - Reindex channel\n"
-        "• /stats - Bot statistics\n"
-        "• /help - Show this message\n\n"
-        "*Just type a movie name to search!*\n\n"
-        "Examples:\n"
-        "• Avengers\n"
-        "• Iron Man 3\n"
-        "• Kantara"
+# Bot command handlers
+@bot.on_message(filters.command("start") & filters.private)
+async def start_command(client, message: Message):
+    """Welcome message"""
+    logger.info(f"START from {message.from_user.id}")
+    
+    welcome = (
+        "🎬 **Movie Bot v4.0 - Lightning Fast!**\n\n"
+        "Just type a movie name to search!\n\n"
+        "**Commands:**\n"
+        "• /search <name> - Search movies\n"
+        "• /latest - Latest 10 movies\n"
+        "• /stats - Statistics\n"
+        "• /index - Rebuild index\n"
+        "• /help - This message\n\n"
+        "**Examples:**\n"
+        "`Avengers`\n"
+        "`Kantara`\n"
+        "`Iron Man`"
     )
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await message.reply_text(welcome)
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot statistics"""
-    stats_text = (
-        f"📊 *Bot Statistics*\n\n"
-        f"Total movies indexed: {len(movies_db)}\n"
-        f"Channel: {CHANNEL_ID}\n"
-        f"Status: ✅ Running"
+@bot.on_message(filters.command("help") & filters.private)
+async def help_command(client, message: Message):
+    """Help message"""
+    await start_command(client, message)
+
+@bot.on_message(filters.command("stats") & filters.private)
+async def stats_command(client, message: Message):
+    """Show statistics"""
+    status = "🔄 Indexing..." if indexing_in_progress else "✅ Ready"
+    
+    stats = (
+        f"📊 **Bot Statistics**\n\n"
+        f"Status: {status}\n"
+        f"Indexed Movies: **{len(movies_db)}**\n"
+        f"Last Indexed: {last_indexed or 'Never'}\n"
+        f"Channel: `{CHANNEL_USERNAME}`"
     )
-    await update.message.reply_text(stats_text, parse_mode='Markdown')
+    await message.reply_text(stats)
 
-async def index_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.on_message(filters.command("index") & filters.private)
+async def index_command(client, message: Message):
     """Manually trigger indexing"""
-    await update.message.reply_text("🔄 Starting indexing... This may take a moment.")
-    count = await index_channel_messages(context)
-    await update.message.reply_text(f"✅ Indexed {count} messages!")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send help message"""
-    await start(update, context)
-
-async def search_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Smart search for movies with relevance scoring"""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Please provide a movie name!\n\n"
-            "Usage: /search Avengers\n"
-            "Or just type: Avengers"
-        )
+    if indexing_in_progress:
+        await message.reply_text("⏳ Indexing already in progress...")
         return
     
-    query = ' '.join(context.args)
-    logger.info(f"SEARCH: '{query}' by user {update.effective_user.id}")
-    
-    search_msg = await update.message.reply_text(f"🔍 Searching for '*{query}*'...", parse_mode='Markdown')
-    
-    try:
-        results = []
-        checked = 0
-        query_lower = query.lower()
-        
-        # Search through channel messages with smart matching
-        for msg_id in range(1, 200):
-            try:
-                # Forward message temporarily to check content
-                msg = await context.bot.forward_message(
-                    chat_id=update.effective_chat.id,
-                    from_chat_id=CHANNEL_ID,
-                    message_id=msg_id,
-                    disable_notification=True
-                )
-                checked += 1
-                
-                # Get text content
-                text_content = msg.text or msg.caption or ""
-                
-                if not text_content:
-                    # Delete non-text message
-                    try:
-                        await msg.delete()
-                    except:
-                        pass
-                    continue
-                
-                # Extract title and keywords
-                title = extract_movie_title(text_content)
-                keywords = extract_keywords(text_content)
-                
-                # Calculate relevance
-                movie_data = {
-                    'title': title,
-                    'text': text_content,
-                    'keywords': keywords
-                }
-                
-                relevance = calculate_relevance(query, movie_data)
-                
-                # If relevant, keep it
-                if relevance > 0:
-                    results.append({
-                        'msg_id': msg_id,
-                        'msg_obj': msg,
-                        'title': title,
-                        'score': relevance
-                    })
-                    logger.info(f"✓ Found: {title} (score: {relevance})")
-                else:
-                    # Delete non-matching message
-                    try:
-                        await msg.delete()
-                    except:
-                        pass
-                
-                # Stop if we have enough results
-                if len(results) >= 15:
-                    break
-                    
-            except Exception as e:
-                continue
-        
-        # Delete search message
-        try:
-            await search_msg.delete()
-        except:
-            pass
-        
-        if results:
-            # Sort by relevance score
-            results.sort(key=lambda x: x['score'], reverse=True)
-            
-            # Keep only top 5 results
-            top_results = results[:5]
-            
-            # Delete the rest
-            for result in results[5:]:
-                try:
-                    await result['msg_obj'].delete()
-                except:
-                    pass
-            
-            result_text = f"✅ *Found {len(top_results)} movie(s) for '{query}'*\n"
-            result_text += f"_(Searched {checked} messages)_\n\n"
-            
-            for i, result in enumerate(top_results, 1):
-                result_text += f"{i}. {result['title']}\n"
-            
-            await update.message.reply_text(result_text, parse_mode='Markdown')
-        else:
-            await update.message.reply_text(
-                f"❌ No movies found for '*{query}*'\n"
-                f"_(Searched {checked} messages)_\n\n"
-                "*Try:*\n"
-                "• Different spelling\n"
-                "• Shorter keywords\n"
-                "• /latest for recent movies",
-                parse_mode='Markdown'
-            )
-    except Exception as e:
-        logger.error(f"Search error: {e}")
-        try:
-            await update.message.reply_text("❌ Search error occurred. Please try again.")
-        except:
-            pass
+    status_msg = await message.reply_text("🔄 Starting indexing...")
+    await index_channel()
+    await status_msg.edit_text(f"✅ Indexed {len(movies_db)} movies!")
 
-async def get_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.on_message(filters.command("search") & filters.private)
+async def search_command(client, message: Message):
+    """Search for movies"""
+    # Get query from command
+    query = message.text.split(maxsplit=1)
+    if len(query) < 2:
+        await message.reply_text("❌ Please provide a movie name!\n\nExample: `/search Avengers`")
+        return
+    
+    query = query[1].strip()
+    await perform_search(client, message, query)
+
+@bot.on_message(filters.command("latest") & filters.private)
+async def latest_command(client, message: Message):
     """Get latest movies"""
-    logger.info(f"LATEST command from user {update.effective_user.id}")
-    status_msg = await update.message.reply_text("📥 Fetching latest movies...")
+    logger.info(f"LATEST from {message.from_user.id}")
+    
+    status_msg = await message.reply_text("📥 Fetching latest movies...")
     
     try:
+        # Get latest messages directly from channel
         count = 0
-        # Start from higher message IDs (recent ones)
-        for msg_id in range(200, 0, -1):
+        async for msg in bot.get_chat_history(CHANNEL_USERNAME, limit=10):
             try:
-                msg = await context.bot.forward_message(
-                    chat_id=update.effective_chat.id,
-                    from_chat_id=CHANNEL_ID,
-                    message_id=msg_id
-                )
+                # Forward to user
+                await msg.forward(message.chat.id)
                 count += 1
-                logger.info(f"Forwarded message {msg_id}")
-                
-                if count >= 5:
-                    break
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not forward: {e}")
                 continue
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
+        await status_msg.delete()
         
         if count > 0:
-            await update.message.reply_text(f"✅ Here are the {count} latest movies")
+            await message.reply_text(f"✅ Sent {count} latest movies")
         else:
-            await update.message.reply_text("❌ Could not fetch movies. Check bot permissions!")
+            await message.reply_text("❌ No movies found")
+            
     except Exception as e:
         logger.error(f"Latest error: {e}")
-        try:
-            await update.message.reply_text("❌ Error occurred")
-        except:
-            pass
+        await message.reply_text("❌ Error fetching movies")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages as search queries"""
-    text = update.message.text
-    logger.info(f"MESSAGE from {update.effective_user.id}: {text}")
+@bot.on_message(filters.text & filters.private & ~filters.command(""))
+async def handle_text(client, message: Message):
+    """Handle plain text as search query"""
+    query = message.text.strip()
+    logger.info(f"TEXT from {message.from_user.id}: {query}")
+    await perform_search(client, message, query)
+
+async def perform_search(client, message: Message, query: str):
+    """Perform fast search using indexed data"""
+    logger.info(f"SEARCH: '{query}' by {message.from_user.id}")
     
-    if text and not text.startswith('/'):
-        context.args = text.split()
-        await search_movies(update, context)
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors but don't crash"""
-    logger.error(f"ERROR: {context.error}")
-
-def run_bot():
-    """Run the Telegram bot"""
+    if not movies_db:
+        await message.reply_text("⏳ Database is empty. Running /index first...")
+        await index_channel()
+        if not movies_db:
+            await message.reply_text("❌ No movies found in channel")
+            return
+    
+    search_msg = await message.reply_text(f"🔍 Searching for '**{query}**'...")
+    
     try:
-        logger.info("🤖 Initializing bot...")
+        # Search through indexed database
+        results = []
         
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
+        for msg_id, movie_data in movies_db.items():
+            score = calculate_match_score(query, movie_data)
+            if score > 0:
+                results.append({
+                    'msg_id': msg_id,
+                    'title': movie_data['title'],
+                    'score': score
+                })
         
-        # Delete any existing webhooks
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.bot.delete_webhook(drop_pending_updates=True))
-        logger.info("✅ Webhook deleted")
+        # Sort by relevance
+        results.sort(key=lambda x: x['score'], reverse=True)
         
-        # Add handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("search", search_movies))
-        application.add_handler(CommandHandler("latest", get_latest))
-        application.add_handler(CommandHandler("stats", stats_command))
-        application.add_handler(CommandHandler("index", index_command))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        application.add_error_handler(error_handler)
+        # Take top 5
+        top_results = results[:5]
         
-        logger.info("✅ Bot handlers registered")
-        logger.info("🚀 Starting polling...")
+        await search_msg.delete()
         
-        # Start polling
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-        
+        if top_results:
+            # Show results summary
+            summary = f"✅ **Found {len(top_results)} result(s):**\n\n"
+            for i, r in enumerate(top_results, 1):
+                summary += f"{i}. {r['title']}\n"
+            
+            await message.reply_text(summary)
+            
+            # Forward the actual messages
+            for result in top_results:
+                try:
+                    # Forward from channel to user
+                    await bot.forward_messages(
+                        chat_id=message.chat.id,
+                        from_chat_id=CHANNEL_USERNAME,
+                        message_ids=result['msg_id']
+                    )
+                    await asyncio.sleep(0.5)  # Small delay to avoid flood
+                except Exception as e:
+                    logger.error(f"Error forwarding {result['msg_id']}: {e}")
+        else:
+            await message.reply_text(
+                f"❌ No results for '**{query}**'\n\n"
+                "Try:\n"
+                "• Different keywords\n"
+                "• Shorter search terms\n"
+                "• /latest for recent movies"
+            )
+            
     except Exception as e:
-        logger.error(f"❌ Bot failed to start: {e}", exc_info=True)
+        logger.error(f"Search error: {e}")
+        await message.reply_text("❌ Search error occurred")
 
 def run_flask():
     """Run Flask server"""
@@ -431,12 +399,32 @@ def run_flask():
     except Exception as e:
         logger.error(f"Flask error: {e}")
 
+async def startup():
+    """Bot startup tasks"""
+    logger.info("🤖 Bot started successfully!")
+    logger.info("🔄 Starting initial indexing...")
+    await index_channel()
+    logger.info("✅ Bot ready to serve!")
+
 if __name__ == '__main__':
-    logger.info("🎬 Starting Movie Bot v2.0...")
+    logger.info("🎬 Starting Movie Bot v4.0 (Pyrogram)...")
     
-    # Start Flask in background thread
+    # Start Flask in background
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # Run bot in main thread
-    run_bot()
+    # Start bot
+    logger.info("🚀 Starting Pyrogram bot...")
+    
+    # Run startup tasks and then start bot
+    bot.start()
+    
+    # Run indexing on startup
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(startup())
+    
+    # Keep bot running
+    from pyrogram import idle
+    idle()
+    
+    bot.stop()

@@ -53,7 +53,7 @@ async def search(_, msg):
         return
 
     buttons = []
-    for title, file_id, type_, season in results:
+    for title, message_id, type_, season in results:
         if type_.lower() == "series":
             buttons.append([InlineKeyboardButton(f"{title} (Series)", callback_data=f"series:{title}")])
         else:

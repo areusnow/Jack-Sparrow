@@ -36,7 +36,7 @@ async def index_channel(_, msg):
         quality = re.search(r"Quality:\s*(.*)", caption)
 
         add_file(
-            file_id=msg.document.file_id if msg.document else msg.video.file_id,
+            message_id = msg.id,
             title=title.group(1).strip() if title else "Unknown",
             type_=type_.group(1).strip() if type_ else "Movie",
             season=int(season.group(1)) if season else None,
@@ -94,14 +94,28 @@ async def handle_season(_, query):
     await query.message.reply(f"📼 Choose episode:", reply_markup=InlineKeyboardMarkup(buttons))
 
 @bot.on_callback_query(filters.regex("^movie:"))
-async def send_movie(_, query):
-    file_id = query.data.split(":")[1]
-    await query.message.reply_document(file_id)
+async def send_movie(client, query):
+    message_id = int(query.data.split(":")[1])
+    try:
+        await client.copy_message(
+            chat_id=query.message.chat.id,
+            from_chat_id=CHANNEL_ID,
+            message_id=message_id
+        )
+    except Exception as e:
+        await query.message.reply(f"⚠️ Error sending file: {e}")
 
 @bot.on_callback_query(filters.regex("^send:"))
-async def send_episode(_, query):
-    file_id = query.data.split(":")[1]
-    await query.message.reply_document(file_id)
+async def send_episode(client, query):
+    message_id = int(query.data.split(":")[1])
+    try:
+        await client.copy_message(
+            chat_id=query.message.chat.id,
+            from_chat_id=CHANNEL_ID,
+            message_id=message_id
+        )
+    except Exception as e:
+        await query.message.reply(f"⚠️ Error sending episode: {e}")
 
 if __name__ == "__main__":
     init_db()

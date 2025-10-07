@@ -5,6 +5,11 @@ from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, C
 from dotenv import load_dotenv
 from rapidfuzz import fuzz, process
 import re
+from fuzzywuzzy import process
+
+def fuzzy_search(query, data):
+    result = process.extractOne(query, data)
+    return result[0] if result else None
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")

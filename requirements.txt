@@ -4,4 +4,3 @@ python-dotenv
 fuzzywuzzy
 python-Levenshtein
 flask
-sqlite3-bro

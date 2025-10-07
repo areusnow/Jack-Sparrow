@@ -83,7 +83,7 @@ async def handle_season(_, query):
     from sqlite3 import connect
     conn = connect("movies.db")
     cur = conn.cursor()
-    cur.execute("SELECT file_id, episode FROM files WHERE title=? AND season=?", (title, season))
+    cur.execute("SELECT message_id, episode FROM files WHERE title=? AND season=?", (title, season))
     episodes = cur.fetchall()
     conn.close()
 

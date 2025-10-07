@@ -57,7 +57,7 @@ async def search(_, msg):
         if type_.lower() == "series":
             buttons.append([InlineKeyboardButton(f"{title} (Series)", callback_data=f"series:{title}")])
         else:
-            buttons.append([InlineKeyboardButton(f"{title}", callback_data=f"movie:{file_id}")])
+            buttons.append([InlineKeyboardButton(f"{title}", callback_data=f"movie:{message_id}")])
 
     await msg.reply("🔎 Closest matches:", reply_markup=InlineKeyboardMarkup(buttons))
 

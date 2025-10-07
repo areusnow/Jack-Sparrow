@@ -1,14 +1,15 @@
 services:
   - type: web
-    name: telegram-movie-bot
+    name: movie-bot
     env: python
-    plan: free
-    buildCommand: pip install --only-binary=:all: -r requirements.txt
-    startCommand: python main.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.7
+      - key: API_ID
+        value: your_api_id
+      - key: API_HASH
+        value: your_api_hash
       - key: BOT_TOKEN
-        sync: false   # you’ll add this manually in Render Dashboard
+        value: your_bot_token
       - key: CHANNEL_ID
-        sync: false   # you’ll add this manually in Render Dashboard
+        value: -100xxxxxxxxx

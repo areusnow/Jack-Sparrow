@@ -6,7 +6,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id TEXT,
+            message_id INTEGER,
             title TEXT,
             type TEXT,
             season INTEGER,
@@ -17,13 +17,13 @@ def init_db():
     conn.commit()
     conn.close()
 
-def add_file(file_id, title, type_, season=None, episode=None, quality=None):
+def add_file(message_id, title, type_, season=None, episode=None, quality=None):
     conn = sqlite3.connect("movies.db")
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO files (file_id, title, type, season, episode, quality)
+        INSERT INTO files (message_id, title, type, season, episode, quality)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (file_id, title, type_, season, episode, quality))
+    """, (message_id, title, type_, season, episode, quality))
     conn.commit()
     conn.close()
 
@@ -31,7 +31,7 @@ def search_files(query):
     from fuzzywuzzy import process
     conn = sqlite3.connect("movies.db")
     cur = conn.cursor()
-    cur.execute("SELECT title, file_id, type, season FROM files")
+    cur.execute("SELECT title, message_id, type, season FROM files")
     all_files = cur.fetchall()
     conn.close()
 

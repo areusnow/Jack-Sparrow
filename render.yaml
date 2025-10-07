@@ -1,19 +1,14 @@
 services:
-  - type: worker
+  - type: web
     name: telegram-movie-bot
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
+    buildCommand: pip install --only-binary=:all: -r requirements.txt
+    startCommand: python main.py
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.7
       - key: BOT_TOKEN
-        sync: false
+        sync: false   # you’ll add this manually in Render Dashboard
       - key: CHANNEL_ID
-        sync: false
-
-runtime: python
-buildCommand: pip install -r requirements.txt
-startCommand: python main.py
-env:
-  - key: PYTHON_VERSION
-    value: 3.11.7
+        sync: false   # you’ll add this manually in Render Dashboard

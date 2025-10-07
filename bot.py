@@ -85,7 +85,7 @@ app = Flask(__name__)
 def home():
     status = "Indexing..." if indexing_in_progress else "Ready"
     return f'''
-    <h1>🎬 Movie Bot v4.1 (Pyrogram)</h1>
+    <h1>🎬 Movie Bot v4.2 (Fixed)</h1>
     <p>Status: {status}</p>
     <p>Total Movies: {len(movies_db)}</p>
     <p>Last Indexed: {last_indexed or "Never"}</p>
@@ -188,7 +188,8 @@ async def index_channel():
         indexed = 0
         start_time = time.time()
 
-        async for message in bot.get_chat_history(CHANNEL_USERNAME, limit=1000):
+        # FIXED: Use iter_chat_history instead of get_chat_history
+        async for message in bot.iter_chat_history(CHANNEL_USERNAME, limit=5000):
             try:
                 text = message.text or message.caption or ""
                 if not text and not (message.video or message.document):
@@ -217,7 +218,7 @@ async def index_channel():
                 if indexed % 200 == 0:
                     logger.info(f"Indexed {indexed} messages... autosaving")
                     save_db()
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
 
             except FloodWait as e:
                 logger.warning(f"FloodWait: sleeping {e.value}s")
@@ -243,7 +244,7 @@ async def index_channel():
 @bot.on_message(filters.command("start") & filters.private)
 async def start_command(client, message: Message):
     welcome = (
-        "🎬 **Movie Bot v4.1 - Lightning Fast!**\n\n"
+        "🎬 **Movie Bot v4.2 - Fixed!**\n\n"
         "Just type a movie name to search!\n\n"
         "**Commands:**\n"
         "• /search <name> - Search movies\n"
@@ -288,7 +289,8 @@ async def latest_command(client, message: Message):
     status_msg = await message.reply_text("📥 Fetching latest movies...")
     count = 0
     try:
-        async for msg in bot.get_chat_history(CHANNEL_USERNAME, limit=10):
+        # FIXED: Use iter_chat_history
+        async for msg in bot.iter_chat_history(CHANNEL_USERNAME, limit=10):
             try:
                 await msg.forward(message.chat.id)
                 count += 1
@@ -378,5 +380,5 @@ async def main():
         await idle()
 
 if __name__ == '__main__':
-    logger.info("🎬 Starting Movie Bot v4.1 (Pyrogram)...")
+    logger.info("🎬 Starting Movie Bot v4.2 (Fixed)...")
     asyncio.run(main())
